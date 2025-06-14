@@ -265,7 +265,7 @@ train_loader = DataLoaderLite(B=4, T=30)
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(GPTConfig(50304))
 model.to(device)
 model = torch.compile(model)
 # optimize!
