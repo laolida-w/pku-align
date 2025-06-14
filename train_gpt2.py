@@ -22,29 +22,30 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, idx, targets=None):
-        # idx is of shape (B, T)
-        B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward the token and posisition embeddings
-        pos = torch.arange(0, T, dtype=torch.long,
-                           device=idx.device)  # shape (T)
-        # position embeddings of shape (T, n_embd)
-        pos_emb = self.transformer.wpe(pos)
-        # token embeddings of shape (B, T, n_embd)
-        tok_emb = self.transformer.wte(idx)
-        x = tok_emb + pos_emb
-        # forward the blocks of the transformer
-        for block in self.transformer.h:
-            x = block(x)
-        # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1,  2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True)  # flash attention
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # output projection
+        y = self.c_proj(y)
+        return y
 
 
 class MLP(nn.Module):
@@ -120,10 +121,10 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size i"
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # forward the token and posisition embeddings
         pos = torch.arange(0, T, dtype=torch.long,
                            device=idx.device)  # shape (T)
@@ -138,7 +139,11 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -260,7 +265,7 @@ train_loader = DataLoaderLite(B=4, T=30)
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 # optimize!
