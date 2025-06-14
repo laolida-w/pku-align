@@ -1,3 +1,4 @@
+import sys
 import tiktoken
 import numpy as np
 from dataclasses import dataclass
@@ -20,26 +21,29 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C //
-                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C //
-                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C //
-                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True)  # flash attention
-        # re-assemble all head outputs side by side
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        # output projection
-        y = self.c_proj(y)
-        return y
+    def forward(self, idx, targets=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long,
+                           device=idx.device)  # shape (T)
+        # position embeddings of shape (T, n_embd)
+        pos_emb = self.transformer.wpe(pos)
+        # token embeddings of shape (B, T, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 
 class MLP(nn.Module):
@@ -179,6 +183,36 @@ class GPT(nn.Module):
         return model
 
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -187,14 +221,30 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-num_return_sequences = 5
-max_length = 30
+# get a data batch
+train_loader = DataLoaderLite(B=4, T=30)
 
+# get logits
 model = GPT(GPTConfig())
-model.eval()
 model.to(device)
 
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+sys.exit(0)
+
 # prefix tokens
+model.eval()
+num_return_sequences = 5
+max_length = 30
 enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
