@@ -98,10 +98,10 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx):
         # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size i"
         # forward the token and posisition embeddings
         pos = torch.arange(0, T, dtype=torch.long,
                            device=idx.device)  # shape (T)
@@ -116,11 +116,7 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -183,19 +179,27 @@ class GPT(nn.Module):
         return model
 
 
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.eval()
-model.to('cuda')
+model.to(device)
 
 # prefix tokens
 enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 # x is (B, T) where B = 5, T = 8
 # set the seed to 42
@@ -205,7 +209,7 @@ while x.size(1) < max_length:
     # forward the model to get the logits
     with torch.no_grad():
         logits = model(x)  # (B, T, vocab_size)
-        # take the logits at the last position
+        # take the logits at the last position()
         logits = logits[:, -1, :]  # (B, vocab_size)
         # get the probabilities
         probs = F.softmax(logits, dim=-1)
